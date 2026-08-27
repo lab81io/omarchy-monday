@@ -35,15 +35,41 @@ def die(message, kind="error"):
     sys.exit(0)
 
 
+def validated_token(value):
+    """Reject a token that cannot go in an HTTP header, without echoing it.
+
+    http.client refuses a header value containing CR/LF and raises a ValueError
+    whose message quotes the whole value; a non-latin-1 character raises too.
+    Either traceback would carry the token into stderr, so catch it here where
+    the message can be written without interpolating the secret. A stray
+    interior newline is the realistic case — .strip() removes a trailing one,
+    but not one picked up mid-paste.
+    """
+    if any(c in value for c in "\r\n\t"):
+        die(
+            "The API token contains a line break. Check that "
+            "~/.config/omarchy/monday/token holds the token on a single line "
+            "and nothing else.",
+            kind="auth",
+        )
+    if not all(32 <= ord(c) <= 126 for c in value):
+        die(
+            "The API token contains a non-printable or non-ASCII character. "
+            "Re-copy it from monday → avatar → Developers → My access tokens.",
+            kind="auth",
+        )
+    return value
+
+
 def read_token():
     env = os.environ.get("MONDAY_API_TOKEN", "").strip()
     if env:
-        return env
+        return validated_token(env)
     path = CONFIG_DIR / "token"
     if path.exists():
         value = path.read_text(encoding="utf-8").strip()
         if value:
-            return value
+            return validated_token(value)
     die(
         "No monday.com API token. Put one in ~/.config/omarchy/monday/token "
         "(monday → avatar → Developers → My access tokens).",
@@ -80,7 +106,18 @@ def gql(token, query, variables=None):
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+    except ValueError:
+        # http.client raises ValueError/UnicodeEncodeError for a header value it
+        # cannot send, and quotes the value in the message — which here is the
+        # token. validated_token() should have caught this already; if it did
+        # not, fail with a fixed string rather than let a traceback carrying the
+        # secret reach stderr. Never interpolate this exception.
+        die(
+            "The API token is not a valid HTTP header value. Check "
+            "~/.config/omarchy/monday/token.",
+            kind="auth",
+        )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
         if exc.code in (401, 403):
@@ -90,6 +127,11 @@ def gql(token, query, variables=None):
         die("Could not reach monday.com: %s" % exc.reason, kind="network")
     except (TimeoutError, OSError) as exc:
         die("Could not reach monday.com: %s" % exc, kind="network")
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        die("monday.com returned a response that is not JSON", kind="api")
 
     if payload.get("errors"):
         message = "; ".join(str(e.get("message", e)) for e in payload["errors"])[:300]

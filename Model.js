@@ -168,3 +168,11 @@ function rowsFor(items) {
   }
   return out
 }
+
+// Strip anything Qt's AutoText heuristic could latch onto as rich text.
+// Panel.qml pins textFormat: Text.PlainText on everything it renders itself,
+// but the bar tooltip is drawn by the shell's shared PanelToolTip, whose Text
+// this plugin does not control — so text headed there is cleaned here instead.
+function plain(text) {
+  return String(text || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim()
+}

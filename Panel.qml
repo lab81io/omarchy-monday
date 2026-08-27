@@ -148,7 +148,9 @@ Panel {
     fixedHeight: vertical ? Math.max(Style.space(28), barContent.implicitHeight + Style.spaceReal(5) * 2) : -1
     tooltipText: monday.needsToken
       ? "monday.com — no API token set"
-      : (monday.failed ? "monday.com — " + monday.lastError : "monday.com — " + Model.summaryLine(monday.items))
+      : (monday.failed
+          ? "monday.com — " + Model.plain(monday.lastError)
+          : "monday.com — " + Model.summaryLine(monday.items))
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) monday.refresh()
@@ -263,6 +265,7 @@ Panel {
             color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
             wrapMode: Text.WordWrap
           }
 
@@ -425,12 +428,17 @@ Panel {
         Layout.fillWidth: true
         spacing: Style.space(1)
 
+        // PlainText, not the AutoText default: item and board names are free
+        // text that anyone with write access to a shared board can set, and
+        // Qt would otherwise parse a leading tag as rich text and resolve
+        // <img src="https://..."> into a live outbound request.
         Text {
           Layout.fillWidth: true
           text: itemRow.item ? String(itemRow.item.name) : ""
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+          textFormat: Text.PlainText
           elide: Text.ElideRight
         }
 
@@ -442,6 +450,7 @@ Panel {
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+          textFormat: Text.PlainText
           elide: Text.ElideRight
         }
       }
@@ -495,6 +504,7 @@ Panel {
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+          textFormat: Text.PlainText
           elide: Text.ElideRight
         }
 

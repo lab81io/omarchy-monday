@@ -75,9 +75,17 @@ Item {
     root.refreshed()
   }
 
+  // monday generates item and board URLs server-side, so this guard is not
+  // closing a live hole — it is here so that the day one of those fields
+  // becomes settable, a value like "--gpu-launcher=..." is rejected rather
+  // than spliced into the browser's argv by omarchy-launch-browser, which
+  // passes "$@" through without a -- separator.
   function openUrl(url) {
     var target = String(url || "")
-    if (target === "") return
+    if (!/^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?\//.test(target)) {
+      console.warn("lab81io.monday: refusing to open non-https URL")
+      return
+    }
     Quickshell.execDetached(["omarchy-launch-browser", target])
   }
 
@@ -120,11 +128,15 @@ Item {
         root.apply(out)
         return
       }
-      var err = String(fetchStderr.text || "").trim()
+      // Deliberately NOT surfacing helper stderr. Every expected failure comes
+      // back as structured JSON on stdout; stderr only ever holds a Python
+      // traceback, and a traceback frame can quote the value that caused it —
+      // including the API token, if it is malformed enough to break header
+      // encoding. That belongs in the journal, not on the bar.
+      console.warn("lab81io.monday: helper failed (exit " + exitCode + "): "
+        + String(fetchStderr.text || "").trim())
       root.errorKind = "helper"
-      root.lastError = err !== ""
-        ? err.split("\n").pop().substring(0, 160)
-        : "monday helper exited with code " + exitCode
+      root.lastError = "monday helper failed (exit " + exitCode + ") — see journalctl --user"
     }
   }
 }
