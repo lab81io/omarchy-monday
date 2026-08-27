@@ -1,0 +1,8 @@
+# Never let credentials near this repo. The plugin reads its token from
+# ~/.config/omarchy/monday/token, outside the plugin folder — these patterns
+# are belt-and-braces in case one is ever dropped in here by hand.
+token
+*.token
+.env
+__pycache__/
+*.pyc

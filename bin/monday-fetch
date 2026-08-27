@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Fetch monday.com work assigned to you, plus per-board status rollups.
+
+Emits a single JSON object on stdout for the Omarchy shell plugin to render.
+Nothing here is monday-account specific: board layouts differ wildly, so the
+person / status / date columns are discovered by type on every run rather than
+hardcoded, and "which label counts as Done" is read from the board's own
+`done_colors` setting instead of guessed from English label text.
+
+Config (all optional):
+  ~/.config/omarchy/monday/token    API token, or $MONDAY_API_TOKEN
+  ~/.config/omarchy/monday/boards   one board id per line; falls back to the
+                                    8 most recently used boards
+"""
+
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+API = "https://api.monday.com/v2"
+API_VERSION = "2024-10"
+CONFIG_DIR = pathlib.Path.home() / ".config" / "omarchy" / "monday"
+DEFAULT_BOARD_LIMIT = 8
+ITEMS_PAGE = 100
+MAX_ITEMS_PER_BOARD = 1000
+TIMEOUT = 25
+
+
+def die(message, kind="error"):
+    json.dump({"ok": False, "kind": kind, "error": message, "items": [], "boards": []}, sys.stdout)
+    sys.stdout.write("\n")
+    sys.exit(0)
+
+
+def read_token():
+    env = os.environ.get("MONDAY_API_TOKEN", "").strip()
+    if env:
+        return env
+    path = CONFIG_DIR / "token"
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    die(
+        "No monday.com API token. Put one in ~/.config/omarchy/monday/token "
+        "(monday → avatar → Developers → My access tokens).",
+        kind="auth",
+    )
+
+
+def configured_boards():
+    ids = [a.strip() for a in sys.argv[1:] if a.strip()]
+    if ids:
+        return ids
+    path = CONFIG_DIR / "boards"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def gql(token, query, variables=None):
+    body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+    request = urllib.request.Request(
+        API,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": token,
+            "API-Version": API_VERSION,
+            "User-Agent": "omarchy-monday-plugin/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        if exc.code in (401, 403):
+            die("monday.com rejected the API token (%s). Check ~/.config/omarchy/monday/token." % exc.code, kind="auth")
+        die("monday.com HTTP %s: %s" % (exc.code, detail), kind="http")
+    except urllib.error.URLError as exc:
+        die("Could not reach monday.com: %s" % exc.reason, kind="network")
+    except (TimeoutError, OSError) as exc:
+        die("Could not reach monday.com: %s" % exc, kind="network")
+
+    if payload.get("errors"):
+        message = "; ".join(str(e.get("message", e)) for e in payload["errors"])[:300]
+        die("monday.com API error: %s" % message, kind="api")
+    data = payload.get("data")
+    if data is None:
+        die("monday.com returned no data", kind="api")
+    return data
+
+
+def parse_settings(raw):
+    try:
+        return json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def pick_person_column(columns):
+    people = [c for c in columns if c["type"] == "people"]
+    if not people:
+        return None
+    for column in people:
+        if "owner" in column["title"].lower():
+            return column
+    return people[0]
+
+
+def pick_status_column(columns):
+    """Prefer a status column that declares done_colors, then one titled Status.
+
+    Boards routinely carry several status columns (Status, Priority, Health).
+    The one the board owner marked up with done labels is the one that means
+    "is this finished", which is exactly what the rollup is counting.
+    """
+    statuses = [c for c in columns if c["type"] == "status"]
+    if not statuses:
+        return None
+    with_done = [c for c in statuses if parse_settings(c.get("settings_str")).get("done_colors")]
+    pool = with_done or statuses
+    for column in pool:
+        if column["title"].strip().lower() == "status":
+            return column
+    for column in pool:
+        if "status" in column["id"].lower() or "status" in column["title"].lower():
+            return column
+    return pool[0]
+
+
+def pick_date_column(columns):
+    """A real due date beats a timeline end, which beats any other date column."""
+    dates = [c for c in columns if c["type"] == "date"]
+    for column in dates:
+        title = column["title"].lower()
+        if "due" in title or "deadline" in title or "target" in title:
+            return column
+    timelines = [c for c in columns if c["type"] == "timeline"]
+    if timelines:
+        return timelines[0]
+    return dates[0] if dates else None
+
+
+def column_value(item, column_id):
+    for value in item.get("column_values") or []:
+        if value["id"] == column_id:
+            return value
+    return None
+
+
+def due_from(value):
+    if not value:
+        return ""
+    parsed = parse_settings(value.get("value"))
+    if not parsed:
+        return ""
+    if value.get("type") == "timeline" or "to" in parsed:
+        return str(parsed.get("to") or "")
+    return str(parsed.get("date") or "")
+
+
+def status_index(value):
+    if not value:
+        return None
+    parsed = parse_settings(value.get("value"))
+    index = parsed.get("index")
+    return index if isinstance(index, int) else None
+
+
+class StatusMap:
+    """Board-declared meaning for each status label index."""
+
+    def __init__(self, column):
+        settings = parse_settings(column.get("settings_str")) if column else {}
+        self.labels = {str(k): str(v) for k, v in (settings.get("labels") or {}).items()}
+        self.colors = settings.get("labels_colors") or {}
+        self.done = {str(i) for i in (settings.get("done_colors") or [])}
+
+    def color(self, index):
+        entry = self.colors.get(str(index)) or {}
+        return str(entry.get("color") or "")
+
+    def var_name(self, index):
+        entry = self.colors.get(str(index)) or {}
+        return str(entry.get("var_name") or "")
+
+    def kind(self, index, text):
+        """done / stuck / open, from the board's own colour metadata."""
+        if index is None and not text:
+            return "open"
+        key = str(index)
+        if key in self.done:
+            return "done"
+        var_name = self.var_name(index)
+        if "red" in var_name or "stuck" in str(text).lower():
+            return "stuck"
+        if not self.done and str(text).strip().lower() in ("done", "complete", "completed", "closed"):
+            return "done"
+        return "open"
+
+
+BOARD_META = """
+query ($ids: [ID!]) {
+  boards(ids: $ids) {
+    id
+    name
+    url
+    type
+    columns { id title type settings_str }
+  }
+}
+"""
+
+RECENT_BOARDS = """
+query ($limit: Int!) {
+  boards(limit: $limit, order_by: used_at, state: active) { id }
+}
+"""
+
+MY_ITEMS = """
+query ($board: ID!, $rules: ItemsQuery, $cols: [String!]) {
+  boards(ids: [$board]) {
+    items_page(limit: %d, query_params: $rules) {
+      items {
+        id
+        name
+        url
+        column_values(ids: $cols) { id type text value }
+      }
+    }
+  }
+}
+""" % ITEMS_PAGE
+
+BOARD_ITEMS = """
+query ($board: ID!, $cols: [String!]) {
+  boards(ids: [$board]) {
+    items_page(limit: %d) {
+      cursor
+      items { id column_values(ids: $cols) { id type text value } }
+    }
+  }
+}
+""" % ITEMS_PAGE
+
+NEXT_ITEMS = """
+query ($cursor: String!, $cols: [String!]) {
+  next_items_page(limit: %d, cursor: $cursor) {
+    cursor
+    items { id column_values(ids: $cols) { id type text value } }
+  }
+}
+""" % ITEMS_PAGE
+
+
+def fetch_all_items(token, board_id, columns):
+    """Page a board, requesting only the columns the rollup actually reads."""
+    data = gql(token, BOARD_ITEMS, {"board": board_id, "cols": columns})
+    boards = data.get("boards") or []
+    if not boards:
+        return []
+    page = boards[0]["items_page"]
+    items = list(page.get("items") or [])
+    cursor = page.get("cursor")
+    while cursor and len(items) < MAX_ITEMS_PER_BOARD:
+        data = gql(token, NEXT_ITEMS, {"cursor": cursor, "cols": columns})
+        page = data.get("next_items_page") or {}
+        items.extend(page.get("items") or [])
+        cursor = page.get("cursor")
+    return items
+
+
+def main():
+    token = read_token()
+    me = gql(token, "query { me { id name } }")["me"]
+    my_id = str(me["id"])
+
+    board_ids = configured_boards()
+    if not board_ids:
+        recent = gql(token, RECENT_BOARDS, {"limit": DEFAULT_BOARD_LIMIT})["boards"]
+        board_ids = [str(b["id"]) for b in recent]
+
+    meta = gql(token, BOARD_META, {"ids": board_ids})["boards"] or []
+
+    items_out = []
+    boards_out = []
+
+    for board in meta:
+        # Subitem boards are shadows of their parent and would double-count.
+        if board.get("type") == "sub_items_board" or board["name"].startswith("Subitems of "):
+            continue
+
+        columns = [
+            {
+                "id": c["id"],
+                "title": str(c.get("title") or ""),
+                "type": str(c.get("type") or ""),
+                "settings_str": c.get("settings_str"),
+            }
+            for c in (board.get("columns") or [])
+        ]
+        person_col = pick_person_column(columns)
+        status_col = pick_status_column(columns)
+        date_col = pick_date_column(columns)
+        status_map = StatusMap(status_col)
+
+        wanted = [c["id"] for c in (status_col, date_col) if c]
+
+        # --- My work -------------------------------------------------------
+        if person_col:
+            rules = {
+                "rules": [
+                    {
+                        "column_id": person_col["id"],
+                        "compare_value": ["person-%s" % my_id],
+                        "operator": "any_of",
+                    }
+                ]
+            }
+            data = gql(token, MY_ITEMS, {"board": board["id"], "rules": rules, "cols": wanted})
+            mine = ((data.get("boards") or [{}])[0].get("items_page") or {}).get("items") or []
+            for item in mine:
+                status_value = column_value(item, status_col["id"]) if status_col else None
+                index = status_index(status_value)
+                text = (status_value or {}).get("text") or ""
+                kind = status_map.kind(index, text)
+                if kind == "done":
+                    continue
+                items_out.append(
+                    {
+                        "id": str(item["id"]),
+                        "name": str(item.get("name") or "Untitled"),
+                        "url": str(item.get("url") or board.get("url") or ""),
+                        "board": board["name"],
+                        "boardId": str(board["id"]),
+                        "status": text,
+                        "statusColor": status_map.color(index),
+                        "kind": kind,
+                        "due": due_from(column_value(item, date_col["id"])) if date_col else "",
+                    }
+                )
+
+        # --- Board health --------------------------------------------------
+        counts = {"open": 0, "stuck": 0, "done": 0, "total": 0}
+        labels = {}
+        if status_col:
+            for item in fetch_all_items(token, board["id"], [status_col["id"]]):
+                value = column_value(item, status_col["id"])
+                index = status_index(value)
+                text = (value or {}).get("text") or ""
+                counts[status_map.kind(index, text)] += 1
+                counts["total"] += 1
+                key = text or "No status"
+                if key not in labels:
+                    labels[key] = {"label": key, "count": 0, "color": status_map.color(index)}
+                labels[key]["count"] += 1
+
+        boards_out.append(
+            {
+                "id": str(board["id"]),
+                "name": board["name"],
+                "url": str(board.get("url") or ""),
+                "counts": counts,
+                "labels": sorted(labels.values(), key=lambda entry: -entry["count"]),
+                "statusColumn": status_col["title"] if status_col else "",
+                "dateColumn": date_col["title"] if date_col else "",
+                "tracksMe": bool(person_col),
+            }
+        )
+
+    items_out.sort(key=lambda entry: (entry["due"] == "", entry["due"], entry["name"]))
+
+    json.dump(
+        {
+            "ok": True,
+            "error": None,
+            "me": {"id": my_id, "name": str(me.get("name") or "")},
+            "items": items_out,
+            "boards": boards_out,
+        },
+        sys.stdout,
+    )
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

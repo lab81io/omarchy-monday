@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "lab81io.monday",
+  "name": "monday.com",
+  "version": "1.0.0",
+  "author": "lab81io",
+  "license": "MIT",
+  "description": "Open monday.com work assigned to you in the bar, with a due-date breakdown and per-board status rollups.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "monday.com",
+    "description": "Items assigned to you by urgency, plus a status rollup for each watched board.",
+    "category": "Work",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      }
+    ]
+  }
+}
