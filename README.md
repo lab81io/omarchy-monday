@@ -26,6 +26,21 @@ Later updates are a fast-forward with a diff to review first:
 omarchy plugin update lab81io.monday
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove lab81io.monday
+```
+
+That disables the widget, drops it from the bar layout, and deletes
+`~/.config/omarchy/plugins/lab81io.monday/`. Your token and board list live
+outside the plugin folder and are left alone — delete them separately if you
+want them gone:
+
+```bash
+rm -rf ~/.config/omarchy/monday
+```
+
 ## Setup
 
 1. **Get an API token** — in monday.com: avatar (bottom left) → *Developers* →
@@ -101,3 +116,42 @@ bin/monday-fetch     python3 helper — the only thing that talks to the API
 ```
 
 The helper uses the Python standard library only; no `pip install` needed.
+
+## Validate from source
+
+```bash
+omarchy plugin validate .
+```
+
+## Security and behaviour
+
+This plugin runs unsandboxed inside `omarchy-shell` once enabled. Review the
+source before installing it. What it actually does:
+
+- **External commands.** `python3 bin/monday-fetch` on each refresh, and
+  `omarchy-launch-browser <url>` when you open an item or board. Both are
+  invoked as argument vectors, never through a shell. `openUrl()` requires an
+  `https://` URL before launching anything.
+- **Network access.** HTTPS POSTs to `https://api.monday.com/v2` only, with
+  TLS certificate verification left at Python's verifying default. No
+  telemetry, no other hosts. Text from the API is rendered as
+  `Text.PlainText` so it cannot be reinterpreted as markup.
+- **Files read.** `~/.config/omarchy/monday/token` and, if present,
+  `~/.config/omarchy/monday/boards`.
+- **Files written.** None.
+- **Background behaviour.** One timer per shell session, firing the helper
+  every `refreshIntervalSec` (default 300s) and when the popup is opened.
+- **IPC endpoints.** `lab81io.monday` exposes `open`, `close`, `show`, `hide`,
+  `toggle`, `refresh`, and `count` on the shell's IPC socket, matching
+  first-party plugin practice.
+- **User configuration required outside the repository.** A monday.com API
+  token, as described under Setup. The plugin never writes to it and never
+  modifies your existing configuration.
+
+The token is read from disk only, never logged and never rendered in the UI —
+helper stderr is deliberately sent to the journal rather than the bar, so a
+malformed-token traceback cannot surface a credential on screen.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
