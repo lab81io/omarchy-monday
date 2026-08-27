@@ -3,6 +3,29 @@
 An open-work count in the bar, and a two-tab popup: the items assigned to you
 bucketed by how late they are, and a status rollup for each watched board.
 
+Requires Omarchy 4 (the Quickshell `omarchy-shell`) and `python3` — standard
+library only, nothing to `pip install`.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/lab81io/omarchy-monday.git
+```
+
+Plugins run as unsandboxed code inside your long-running shell process, so it
+lands disabled for you to read first. Then:
+
+```bash
+omarchy plugin enable lab81io.monday
+omarchy bar move lab81io.monday --section right
+```
+
+Later updates are a fast-forward with a diff to review first:
+
+```bash
+omarchy plugin update lab81io.monday
+```
+
 ## Setup
 
 1. **Get an API token** — in monday.com: avatar (bottom left) → *Developers* →
@@ -17,13 +40,7 @@ bucketed by how late they are, and a status rollup for each watched board.
 
    `$MONDAY_API_TOKEN` in the environment is used instead when it is set.
 
-3. **Enable the widget:**
-
-   ```bash
-   omarchy-shell shell rescanPlugins
-   omarchy plugin enable lab81io.monday
-   omarchy bar move lab81io.monday --section right
-   ```
+3. **Pick it up** — left-click the widget and press `r`. No restart needed.
 
 ## Which boards it watches
 
