@@ -26,6 +26,13 @@ Item {
   readonly property int openCount: items ? items.length : 0
   readonly property string helperPath: pluginDir === "" ? "" : pluginDir + "/bin/monday-fetch"
 
+  // StdioCollector has no size ceiling of its own — it buffers the whole stream
+  // — so the helper is the thing that bounds this, and it caps its own output
+  // well below here. This check is the backstop for the shell process: it keeps
+  // an unexpected blob out of JSON.parse, which would otherwise expand it into
+  // a JS object graph several times its own size.
+  readonly property int maxHelperBytes: 8 * 1024 * 1024
+
   signal refreshed()
 
   function setting(name, fallback) {
@@ -50,6 +57,11 @@ Item {
 
   function apply(raw) {
     var parsed
+    if (raw.length > maxHelperBytes) {
+      lastError = "The monday helper returned an implausibly large response"
+      errorKind = "parse"
+      return
+    }
     try {
       parsed = JSON.parse(String(raw || ""))
     } catch (e) {

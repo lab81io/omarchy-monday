@@ -28,11 +28,53 @@ ITEMS_PAGE = 100
 MAX_ITEMS_PER_BOARD = 1000
 TIMEOUT = 25
 
+# Byte and length ceilings. The item limits above bound how many rows are
+# looked at, which is not the same as bounding how many bytes arrive: one
+# oversized field in one row is enough. So every point where bytes enter this
+# process from the network, and every string that leaves it on stdout, is
+# capped independently of the row count. The shell buffers whatever this
+# process writes, so its memory is bounded by MAX_OUTPUT_BYTES.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 4096
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_BOARDS = 24
+MAX_LABELS_PER_BOARD = 60
+MAX_NAME_CHARS = 200
+MAX_BOARD_NAME_CHARS = 120
+MAX_STATUS_CHARS = 80
+MAX_URL_CHARS = 500
+MAX_COLOR_CHARS = 32
+MAX_DUE_CHARS = 32
+
 
 def die(message, kind="error"):
     json.dump({"ok": False, "kind": kind, "error": message, "items": [], "boards": []}, sys.stdout)
     sys.stdout.write("\n")
     sys.exit(0)
+
+
+def clip(value, limit):
+    """Every string on stdout goes through here, so no single API field can
+    outgrow its slot in the panel or the shell's stdout buffer."""
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit]
+
+
+def read_capped(stream, limit):
+    """Read at most `limit` bytes, and fail if the body would exceed it.
+
+    Reading limit + 1 is what makes "too big" detectable without ever holding
+    the oversized body: the read stops one byte past the ceiling.
+    """
+    raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        die(
+            "monday.com sent more than %d MB in a single response, which is far "
+            "beyond anything this widget asks for. Refusing to buffer it."
+            % (limit // (1024 * 1024)),
+            kind="api",
+        )
+    return raw
 
 
 def validated_token(value):
@@ -106,7 +148,10 @@ def gql(token, query, variables=None):
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            raw = response.read().decode("utf-8")
+            # "replace" rather than strict: a body that is not valid UTF-8 must
+            # surface as the "not JSON" error below, not as a UnicodeDecodeError
+            # caught by the ValueError branch and misreported as a bad token.
+            raw = read_capped(response, MAX_RESPONSE_BYTES).decode("utf-8", "replace")
     except ValueError:
         # http.client raises ValueError/UnicodeEncodeError for a header value it
         # cannot send, and quotes the value in the message — which here is the
@@ -119,7 +164,7 @@ def gql(token, query, variables=None):
             kind="auth",
         )
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
+        detail = exc.read(MAX_ERROR_BODY_BYTES).decode("utf-8", "replace")[:300]
         if exc.code in (401, 403):
             die("monday.com rejected the API token (%s). Check ~/.config/omarchy/monday/token." % exc.code, kind="auth")
         die("monday.com HTTP %s: %s" % (exc.code, detail), kind="http")
@@ -305,21 +350,43 @@ query ($cursor: String!, $cols: [String!]) {
 """ % ITEMS_PAGE
 
 
-def fetch_all_items(token, board_id, columns):
-    """Page a board, requesting only the columns the rollup actually reads."""
-    data = gql(token, BOARD_ITEMS, {"board": board_id, "cols": columns})
+def tally_board(token, board_id, column_id, status_map):
+    """Page a board, folding each page into the counters as it arrives.
+
+    A page is dropped before the next one is requested, so a board contributes
+    four integers and at most MAX_LABELS_PER_BOARD short label names to memory
+    rather than its items. Distinct labels are capped because the label name is
+    API data: without a ceiling, a board whose status column has been filled
+    with unique junk would grow this dict without limit.
+    """
+    counts = {"open": 0, "stuck": 0, "done": 0, "total": 0}
+    labels = {}
+    data = gql(token, BOARD_ITEMS, {"board": board_id, "cols": [column_id]})
     boards = data.get("boards") or []
     if not boards:
-        return []
-    page = boards[0]["items_page"]
-    items = list(page.get("items") or [])
-    cursor = page.get("cursor")
-    while cursor and len(items) < MAX_ITEMS_PER_BOARD:
-        data = gql(token, NEXT_ITEMS, {"cursor": cursor, "cols": columns})
-        page = data.get("next_items_page") or {}
-        items.extend(page.get("items") or [])
+        return counts, labels
+    page = boards[0].get("items_page") or {}
+    while True:
+        items = page.get("items") or []
+        for item in items:
+            value = column_value(item, column_id)
+            index = status_index(value)
+            text = clip((value or {}).get("text") or "", MAX_STATUS_CHARS)
+            counts[status_map.kind(index, text)] += 1
+            counts["total"] += 1
+            key = text or "No status"
+            if key in labels:
+                labels[key]["count"] += 1
+            elif len(labels) < MAX_LABELS_PER_BOARD:
+                labels[key] = {
+                    "label": key,
+                    "count": 1,
+                    "color": clip(status_map.color(index), MAX_COLOR_CHARS),
+                }
         cursor = page.get("cursor")
-    return items
+        if not cursor or counts["total"] >= MAX_ITEMS_PER_BOARD:
+            return counts, labels
+        page = gql(token, NEXT_ITEMS, {"cursor": cursor, "cols": [column_id]}).get("next_items_page") or {}
 
 
 def main():
@@ -331,6 +398,7 @@ def main():
     if not board_ids:
         recent = gql(token, RECENT_BOARDS, {"limit": DEFAULT_BOARD_LIMIT})["boards"]
         board_ids = [str(b["id"]) for b in recent]
+    board_ids = board_ids[:MAX_BOARDS]
 
     meta = gql(token, BOARD_META, {"ids": board_ids})["boards"] or []
 
@@ -374,21 +442,21 @@ def main():
             for item in mine:
                 status_value = column_value(item, status_col["id"]) if status_col else None
                 index = status_index(status_value)
-                text = (status_value or {}).get("text") or ""
+                text = clip((status_value or {}).get("text") or "", MAX_STATUS_CHARS)
                 kind = status_map.kind(index, text)
                 if kind == "done":
                     continue
                 items_out.append(
                     {
                         "id": str(item["id"]),
-                        "name": str(item.get("name") or "Untitled"),
-                        "url": str(item.get("url") or board.get("url") or ""),
-                        "board": board["name"],
+                        "name": clip(item.get("name") or "Untitled", MAX_NAME_CHARS),
+                        "url": clip(item.get("url") or board.get("url") or "", MAX_URL_CHARS),
+                        "board": clip(board["name"], MAX_BOARD_NAME_CHARS),
                         "boardId": str(board["id"]),
                         "status": text,
-                        "statusColor": status_map.color(index),
+                        "statusColor": clip(status_map.color(index), MAX_COLOR_CHARS),
                         "kind": kind,
-                        "due": due_from(column_value(item, date_col["id"])) if date_col else "",
+                        "due": clip(due_from(column_value(item, date_col["id"])), MAX_DUE_CHARS) if date_col else "",
                     }
                 )
 
@@ -396,42 +464,38 @@ def main():
         counts = {"open": 0, "stuck": 0, "done": 0, "total": 0}
         labels = {}
         if status_col:
-            for item in fetch_all_items(token, board["id"], [status_col["id"]]):
-                value = column_value(item, status_col["id"])
-                index = status_index(value)
-                text = (value or {}).get("text") or ""
-                counts[status_map.kind(index, text)] += 1
-                counts["total"] += 1
-                key = text or "No status"
-                if key not in labels:
-                    labels[key] = {"label": key, "count": 0, "color": status_map.color(index)}
-                labels[key]["count"] += 1
+            counts, labels = tally_board(token, board["id"], status_col["id"], status_map)
 
         boards_out.append(
             {
                 "id": str(board["id"]),
-                "name": board["name"],
-                "url": str(board.get("url") or ""),
+                "name": clip(board["name"], MAX_BOARD_NAME_CHARS),
+                "url": clip(board.get("url") or "", MAX_URL_CHARS),
                 "counts": counts,
                 "labels": sorted(labels.values(), key=lambda entry: -entry["count"]),
-                "statusColumn": status_col["title"] if status_col else "",
-                "dateColumn": date_col["title"] if date_col else "",
+                "statusColumn": clip(status_col["title"], MAX_STATUS_CHARS) if status_col else "",
+                "dateColumn": clip(date_col["title"], MAX_STATUS_CHARS) if date_col else "",
                 "tracksMe": bool(person_col),
             }
         )
 
     items_out.sort(key=lambda entry: (entry["due"] == "", entry["due"], entry["name"]))
 
-    json.dump(
+    payload = json.dumps(
         {
             "ok": True,
             "error": None,
-            "me": {"id": my_id, "name": str(me.get("name") or "")},
+            "me": {"id": my_id, "name": clip(me.get("name") or "", MAX_NAME_CHARS)},
             "items": items_out,
             "boards": boards_out,
-        },
-        sys.stdout,
+        }
     )
+    # Last line of defence for the shell, which buffers this stream whole: with
+    # every field clipped and every list bounded above, exceeding this means an
+    # assumption broke, so send the small error object instead of the payload.
+    if len(payload) > MAX_OUTPUT_BYTES:
+        die("The monday.com response was too large to render.", kind="api")
+    sys.stdout.write(payload)
     sys.stdout.write("\n")
 
 

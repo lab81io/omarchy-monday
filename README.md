@@ -136,6 +136,12 @@ source before installing it. What it actually does:
   TLS certificate verification left at Python's verifying default. No
   telemetry, no other hosts. Text from the API is rendered as
   `Text.PlainText` so it cannot be reinterpreted as markup.
+- **Resource bounds.** The helper reads at most 8 MB per API response and
+  refuses anything larger, clips every string it emits to a display-sized
+  length, and pages the per-board rollup into counters rather than holding the
+  items, so its own output stays under 4 MB. This matters because the shell
+  buffers that output whole: the API being the only thing on the other end of
+  the socket is not on its own a reason to trust its size.
 - **Files read.** `~/.config/omarchy/monday/token` and, if present,
   `~/.config/omarchy/monday/boards`.
 - **Files written.** None.
