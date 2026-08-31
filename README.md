@@ -143,7 +143,13 @@ source before installing it. What it actually does:
   buffers that output whole: the API being the only thing on the other end of
   the socket is not on its own a reason to trust its size.
 - **Files read.** `~/.config/omarchy/monday/token` and, if present,
-  `~/.config/omarchy/monday/boards`.
+  `~/.config/omarchy/monday/boards`. Both are opened once, without following
+  symlinks and without blocking, and are read only after the open descriptor
+  is confirmed to be a regular file you own and no larger than its cap. A
+  symlink, FIFO, device node, or file owned by someone else at either path is
+  rejected with an error in the panel rather than read. That matters most at
+  the token path, because whatever it holds is sent to monday.com as an
+  `Authorization` header.
 - **Files written.** None.
 - **Background behaviour.** One timer per shell session, firing the helper
   every `refreshIntervalSec` (default 300s) and when the popup is opened.

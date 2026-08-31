@@ -13,9 +13,11 @@ Config (all optional):
                                     8 most recently used boards
 """
 
+import errno
 import json
 import os
 import pathlib
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -37,6 +39,13 @@ TIMEOUT = 25
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
+# The config files are small by nature: one token on one line, a handful of
+# board ids. The ceilings are generous against any honest file and still small
+# enough that a file swapped for something enormous is rejected rather than
+# read into this process.
+MAX_TOKEN_BYTES = 4096
+MAX_BOARDS_FILE_BYTES = 64 * 1024
 MAX_BOARDS = 24
 MAX_LABELS_PER_BOARD = 60
 MAX_NAME_CHARS = 200
@@ -103,13 +112,79 @@ def validated_token(value):
     return value
 
 
+def read_config_file(path, limit):
+    """Read a config file through one descriptor that cannot be redirected,
+    cannot block, and cannot outgrow `limit` bytes. Returns None if absent.
+
+    Both config files live in a user-writable directory, so a path that was
+    checked and a path that is later opened are not necessarily the same file.
+    Nothing here is decided from the path: every check is made against the one
+    descriptor whose bytes are actually read.
+
+    O_NOFOLLOW refuses a symlink planted at the final component — at the token
+    path that is the whole attack, since the contents are sent to monday.com as
+    an Authorization header, so a link to any other file this user can read is
+    enough to exfiltrate it. O_NONBLOCK means a planted FIFO or device node
+    cannot park this helper inside open(), which matters because the shell runs
+    it on a repeating timer and a blocked run holds the slot forever. fstat on
+    the open descriptor then proves the thing about to be read is a plain file
+    owned by this user — which also rejects a hard link to someone else's file,
+    where there is no symlink to refuse. Only then is any byte read, and only
+    up to the cap, so an oversized file is rejected without being buffered.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            die(
+                "%s is a symbolic link. Refusing to read it — replace it with a "
+                "regular file." % path,
+                kind="config",
+            )
+        die("Could not open %s: %s" % (path, exc.strerror), kind="config")
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            die(
+                "%s is not a regular file. Refusing to read it — replace it with "
+                "a regular file." % path,
+                kind="config",
+            )
+        if info.st_uid != os.getuid():
+            die(
+                "%s is owned by another user (uid %d). Refusing to read it."
+                % (path, info.st_uid),
+                kind="config",
+            )
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(limit + 1)
+    finally:
+        os.close(fd)
+
+    if len(raw) > limit:
+        die(
+            "%s is larger than %d bytes, which no valid config file is. "
+            "Refusing to read it." % (path, limit),
+            kind="config",
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Never interpolate the exception: it quotes the offending bytes, which
+        # for the token file is the secret.
+        die("%s is not valid UTF-8 text." % path, kind="config")
+
+
 def read_token():
     env = os.environ.get("MONDAY_API_TOKEN", "").strip()
     if env:
         return validated_token(env)
-    path = CONFIG_DIR / "token"
-    if path.exists():
-        value = path.read_text(encoding="utf-8").strip()
+    text = read_config_file(CONFIG_DIR / "token", MAX_TOKEN_BYTES)
+    if text is not None:
+        value = text.strip()
         if value:
             return validated_token(value)
     die(
@@ -123,11 +198,11 @@ def configured_boards():
     ids = [a.strip() for a in sys.argv[1:] if a.strip()]
     if ids:
         return ids
-    path = CONFIG_DIR / "boards"
-    if not path.exists():
+    text = read_config_file(CONFIG_DIR / "boards", MAX_BOARDS_FILE_BYTES)
+    if text is None:
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             out.append(line)
